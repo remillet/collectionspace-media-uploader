@@ -295,7 +295,10 @@ def create():
             502,
         )
 
-    if blob_resp.status_code != 200:
+    # PUT /media/{csid}/blob is handled server-side by MediaResource.createBlob(),
+    # which returns the response from creating the *Blob* resource (not the Media
+    # update) -- so a successful call legitimately returns 201 Created, not 200.
+    if blob_resp.status_code not in (200, 201):
         return (
             render_template_string(
                 RESULT_TEMPLATE,
