@@ -66,6 +66,7 @@ Security notes:
 import json
 import os
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from functools import wraps
 from xml.sax.saxutils import escape
@@ -394,6 +395,108 @@ def verify_collectionspace_login(base_url: str, username: str, password: str, ve
     return True, None
 
 
+# Action-group letter codes (from CollectionSpace's ActionType/ActionGroup)
+# that this app needs on the "media" resource, and what each one is for.
+REQUIRED_MEDIA_ACTIONS = {
+    "C": "create Media records (POST /media)",
+    "U": "attach uploaded files as Blob records (PUT /media/{csid}/blob)",
+}
+
+
+def _local_tag(tag: str) -> str:
+    """Strip an XML namespace, e.g. '{http://...}permission' -> 'permission'."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_child(element, local_name: str):
+    """First direct child of element whose (namespace-stripped) tag matches."""
+    for child in element:
+        if _local_tag(child.tag) == local_name:
+            return child
+    return None
+
+
+def verify_media_permissions(base_url: str, username: str, password: str, verify_ssl: bool):
+    """Confirm the account can create Media records and attach Blob files.
+
+    Calls the same GET /accounts/0/accountperms endpoint used to verify
+    login (see verify_collectionspace_login), but this time parses the
+    response body instead of only checking the status code.
+
+    /accounts/0/accountperms returns an <account_permission> document
+    with one <permission> element per permission-role relationship the
+    account holds (see AccountPermission.java / PermissionValue.java in
+    the CollectionSpace services source) -- so an account's access to a
+    given resource can be split across more than one entry, if more than
+    one of its roles grants access to that resource. Each entry has a
+    <resourceName> and an <actionGroup>, a string of one-letter action
+    codes (C=create, R=read, U=update, D=delete, L=search/list, I=run).
+
+    Both calls this app makes are checked against the SAME resource,
+    "media" -- /media/{csid}/blob collapses to its parent resource for
+    authorization purposes (see SecurityUtils.java in the CollectionSpace
+    services source):
+        POST /media               -> action CREATE -> resource "media"
+        PUT  /media/{csid}/blob   -> action UPDATE  -> resource "media"
+
+    So this unions the actionGroup letters across every <permission>
+    entry for resourceName == "media" and confirms both 'C' and 'U' are
+    present, rather than requiring a single entry to contain both.
+
+    Returns (True, None) if the account has both permissions, or
+    (False, error_message) describing what's missing, or what went wrong
+    making or parsing the request.
+    """
+    accountperms_url = f"{base_url}/accounts/0/accountperms"
+    try:
+        resp = requests.get(
+            accountperms_url,
+            auth=(username, password),
+            verify=verify_ssl,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, f"Could not reach {base_url} to check your permissions: {exc}"
+
+    if resp.status_code == 401:
+        return False, "Invalid username or password for that CollectionSpace instance."
+    if resp.status_code >= 400:
+        return False, (
+            "Couldn't retrieve your account permissions "
+            f"(HTTP {resp.status_code}) from {accountperms_url}."
+        )
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as exc:
+        return False, f"Couldn't parse the permissions response from CollectionSpace: {exc}"
+
+    media_action_group = set()
+    for element in root.iter():
+        if _local_tag(element.tag) != "permission":
+            continue
+        resource_name_el = _find_child(element, "resourceName")
+        action_group_el = _find_child(element, "actionGroup")
+        if resource_name_el is None or action_group_el is None:
+            continue
+        if (resource_name_el.text or "").strip() != "media":
+            continue
+        media_action_group.update((action_group_el.text or "").strip())
+
+    missing = [
+        action for action in REQUIRED_MEDIA_ACTIONS if action not in media_action_group
+    ]
+    if missing:
+        missing_descriptions = "; ".join(REQUIRED_MEDIA_ACTIONS[a] for a in missing)
+        return False, (
+            "Your CollectionSpace account doesn't have permission to "
+            f"{missing_descriptions}. Ask a CollectionSpace administrator "
+            "to grant a role with create/update access to Media records."
+        )
+
+    return True, None
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
@@ -438,6 +541,19 @@ def login():
                 verify_ssl=verify_ssl,
             ),
             401,
+        )
+
+    ok, error = verify_media_permissions(base_url, username, password, verify_ssl)
+    if not ok:
+        return (
+            render_template_string(
+                LOGIN_TEMPLATE,
+                errors=[error],
+                instance_url=instance_url,
+                username=username,
+                verify_ssl=verify_ssl,
+            ),
+            403,
         )
 
     try:

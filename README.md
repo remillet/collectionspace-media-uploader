@@ -96,12 +96,26 @@ adds a login on top of that:
    (`JpaStorageUtils.CS_CURRENT_USER`) meaning "whichever account is
    currently authenticated" -- so this works for any valid account, not
    just admins who can list all accounts.
-3. On success, your credentials are stored in AWS Secrets Manager and a
+3. That same call's response also tells the app what the account is
+   *allowed to do*. The app parses it for `resourceName` = `media`
+   entries and checks that the combined `actionGroup` across all of
+   them includes both `C` (create, needed for `POST /media`) and `U`
+   (update, needed for `PUT /media/{csid}/blob`) -- an account's media
+   permissions can come from more than one role, so entries are unioned
+   rather than requiring one to have both. If either is missing, login
+   is rejected with a message naming what's missing, instead of letting
+   you discover it mid-upload as a raw 403. This adds no extra API call
+   &mdash; it's the same `/accounts/0/accountperms` request from step 2.
+   (Only `media` permissions matter here -- see
+   [Checking an account's permissions](#checking-an-accounts-permissions)
+   below for why the separate Blob service's permissions are beside the
+   point.)
+4. On success, your credentials are stored in AWS Secrets Manager and a
    reference to that secret is kept in your (signed, HTTP-only) Flask
    session cookie &mdash; the password itself never touches the cookie.
-4. Every subsequent CollectionSpace API call fetches the credentials
+5. Every subsequent CollectionSpace API call fetches the credentials
    fresh from Secrets Manager for that one call.
-5. **Log out** (link in the top nav) deletes the secret and clears your
+6. **Log out** (link in the top nav) deletes the secret and clears your
    session.
 
 **Known limitation:** if you close the browser without clicking "Log
@@ -111,6 +125,50 @@ hook to trigger cleanup. For anything beyond local/personal use, pair
 this app with a scheduled job that deletes secrets under the
 `collectionspace-uploader/session/` prefix past some age (each secret's
 description includes its creation time).
+
+## Checking an account's permissions
+
+If login is rejected for missing Media permissions, or you just want to
+confirm what an account can do before handing it to someone, run the
+included diagnostic script:
+
+```bash
+python3 check_media_permissions.py
+```
+
+It prompts for the instance URL, username, and password (the password
+is entered via `getpass` -- never echoed, logged, or written anywhere)
+and prints every `resourceName`/`actionGroup` entry from that account's
+`GET /accounts/0/accountperms` response that mentions "media" or
+"blob," e.g.:
+
+```
+  resourceName='media'  actionGroup='CRUL'
+```
+
+**Only the `media` resource's permissions matter for this app.**
+CollectionSpace also has a separate, standalone **Blob** service with
+its own line in the permissions admin UI, but this app is never
+authorized against it. `PUT /media/{csid}/blob` is a *sub-resource* of
+Media, and CollectionSpace's `SecurityInterceptor` collapses
+sub-resource paths like `{csid}/blob` to their parent resource
+(`media`) for authorization purposes before the request is checked at
+all. The Media resource's own request handler then creates the Blob
+record on your behalf via an internal, in-process call that never
+re-enters that authorization check. Practically, that means:
+
+- An account can have **no** permissions on the Blob service and still
+  successfully create Blob records through this app, as long as it has
+  `U` on `media`.
+- Granting an account permissions on the Blob service alone won't help
+  it if the account lacks `C`/`U` on `media` -- that's not the
+  permission this app's calls are ever checked against.
+
+This is what step 3 above and `verify_media_permissions()` in `app.py`
+check for; `check_media_permissions.py` is the same query with the raw
+result printed instead of turned into a pass/fail decision, useful for
+seeing exactly what an account has when something doesn't match your
+expectations.
 
 ## Using the form
 
