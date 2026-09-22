@@ -9,7 +9,10 @@ CollectionSpace Technical Documentation ([Media Service REST APIs](https://colle
 verified against the [collectionspace/services](https://github.com/collectionspace/services)
 source code:
 
-1. `POST /media` &mdash; creates the Media record from the Title and ID you provide.
+1. `POST /media` &mdash; creates the Media record from the Title and ID you
+   provide, and, if you chose one, a **Contributor** &mdash; a term drawn from
+   a fixed set of CollectionSpace Person and/or Organization Authority
+   instances. See [The Contributor field](#the-contributor-field) below.
 2. `PUT /media/{csid}/blob` &mdash; uploads your file, which creates a Blob record
    and links it to the Media record created in step 1.
 3. *Optional:* `POST /relations` &mdash; if you asked to relate the Media record
@@ -76,6 +79,11 @@ Optional environment variables:
 - `FLASK_SESSION_COOKIE_SECURE=1` &mdash; set this once the app is served over
   HTTPS, so the session cookie is only ever sent over an encrypted
   connection. Leave it unset for local HTTP development.
+- `CONTRIBUTOR_AUTHORITIES_CONFIG_PATH` &mdash; overrides where the app looks
+  for the **Contributor** field's YAML config file. Defaults to
+  `contributor_authorities.yaml` next to `app.py`, which is checked into
+  the repo, so most setups don't need to set this at all. See
+  [The Contributor field](#the-contributor-field) below.
 
 ## Run
 
@@ -188,6 +196,10 @@ expectations.
   `identificationNumber` fields.
 - **Photo or document to upload** &mdash; the file that becomes the linked Blob
   record's content.
+- **Contributor** &mdash; optional. A type-ahead field: start typing a name and
+  pick a matching suggestion from Person and/or Organization Authority terms
+  drawn from a fixed, admin-configured set of instances &mdash; not free text.
+  See [The Contributor field](#the-contributor-field) below.
 - **Relate this Media record to an existing Object record** / **Object
   Number** &mdash; optional. See
   [Relating a Media record to an Object record](#relating-a-media-record-to-an-object-record)
@@ -211,6 +223,144 @@ relied on to enforce it.
 On success, the result page shows the new Media record's CSID and direct
 links to the Media record, the Blob record, and the raw file content (and,
 if you related it to an Object record, that record's CSID and link too).
+
+## The Contributor field
+
+CollectionSpace's Media schema has a native `contributor` field
+(`media_common.xsd` in the [collectionspace/services](https://github.com/collectionspace/services)
+source), but out of the box it's a single, plain-text string &mdash; not tied
+to any controlled vocabulary. This app restricts it: **Contributor** only
+ever offers terms drawn from a fixed set of CollectionSpace **Person**
+and/or **Organization Authority** instances, chosen by whoever runs this
+app, not the full universe of Person/Organization records in your
+tenant. Deliberately scoped to just these two authority *types*, out of
+every type CollectionSpace has (Place, Concept, Work, Taxonomy, ...) &mdash;
+a Media record's contributor is sensibly either a person or an
+organization.
+
+### Configuring the fixed set
+
+CollectionSpace can have many separate instances of each authority type
+(see `PersonAuthorityResource.java` / `OrganizationClient.java` in the
+services source) &mdash; each instance its own list of terms. The set of
+instances Contributor draws from is configured in a YAML file,
+`contributor_authorities.yaml`, checked into this repo next to `app.py`
+(override the path with `CONTRIBUTOR_AUTHORITIES_CONFIG_PATH`, see
+[Setup](#setup) above). It lists the **shortIdentifiers** of the
+instance(s) you want Contributor to draw from &mdash; not their display
+names &mdash; under two keys:
+
+```yaml
+person_authority_instances:
+  - photographers
+  - donors
+
+organization_authority_instances:
+  - institutions
+```
+
+You can populate either list alone, or both together &mdash; every term in
+every listed instance of either type becomes a selectable Contributor,
+merged into one combined list. Leave both empty (the default) and the
+field is simply unavailable, the same way "relate to Object" is
+unavailable to an account without its required permissions &mdash; the rest
+of the app still works. If you're not sure what an instance's
+shortIdentifier is, `curl` its authority type's list endpoint (e.g.
+`GET /personauthorities`) and match the `<displayName>` you recognize to
+the `<shortIdentifier>` next to it &mdash; the shipped
+`contributor_authorities.yaml` has this command spelled out in its
+comments.
+
+This file is meant to be committed to the repo and shared by the whole
+team, rather than each person setting matching environment variables
+individually, so everyone who runs the app sees the same Contributor
+choices by default. It's read fresh on every page load &mdash; an edit
+takes effect the next time someone loads the form, no app restart
+needed. Lines starting with `#` are comments and are ignored.
+
+**Permission required:** the logged-in account also needs `R` (read) on
+whichever of the `personauthorities` / `orgauthorities` resources
+actually has instances configured &mdash; an account with only
+`person_authority_instances` populated is never required to also have
+Organization Authority read access, and vice versa. This is checked
+(like the relate-to-Object permissions) once per page load via
+`check_contributor_feature_availability()` in `app.py`, sharing a single
+`/accounts/0/accountperms` fetch across every check it needs. If either
+the configuration or a required permission is missing, the Contributor
+field is disabled and the page explains why (naming each missing
+permission separately if more than one is missing), in the same
+`permission-warning` style as the Object Number field.
+
+### Typing a Contributor
+
+Contributor is a type-ahead text field, not a plain dropdown: start typing
+a name and matching suggestions appear, built from every term in the
+configured Person/Organization Authority instances. It's still not free
+text, though &mdash; the visible field only ever accepts a whole, exact
+suggestion. If what's currently typed doesn't exactly match one of them
+(case-insensitively), the field shows "No configured Contributor matches
+&hellip;" and **Create Media record** stays disabled, the same way an
+unconfirmed Object Number blocks submission &mdash; this catches a
+half-typed name before it can be silently submitted as "no Contributor"
+instead of what you actually meant to pick. Clearing the field back to
+empty is always fine; that's a valid "no Contributor" choice.
+
+### How a selection is stored
+
+Contributor isn't free text and isn't a display name &mdash; picking a
+suggestion stores that term's full CollectionSpace **refName**, e.g.:
+
+```
+urn:cspace:core.collectionspace.org:personauthorities:name(photographers):item:name(janedoe)'Jane Doe'
+```
+
+This is deliberate: two different instances &mdash; of the same authority
+type, or one Person and one Organization &mdash; can each have a term called,
+say, "Jane Doe," and a bare display name can't tell them apart. The
+refName can. The field's suggestions disambiguate the same way &mdash;
+`"Jane Doe &mdash; Photographers"` vs. `"Jane Doe &mdash; Donors"` vs.
+`"Jane Doe &mdash; Institutions"` &mdash; built from each term's own
+`termDisplayName` plus its parent authority instance's `displayName`. (The
+term-level field is named `termDisplayName` in the CollectionSpace source,
+not `displayName` &mdash; that plain name is specific to the separate
+Vocabulary service's item lists. `fetch_authority_items()` in `app.py`
+checks `termDisplayName` first, falling back to `displayName` only for
+older CollectionSpace versions that may still emit it.) Behind the scenes,
+picking a suggestion fills a hidden `contributor` form field with the
+matching refName &mdash; the visible text field itself is never what's
+submitted.
+
+**Important caveat:** storing a well-formed refName here makes the value
+correct and unambiguous, but it does *not*, by itself, make CollectionSpace's
+own UI treat `contributor` as a live, clickable authority reference (e.g.
+showing this Media record under that Person or Organization's "used by"
+list). That additionally requires your CollectionSpace tenant's service
+bindings to mark `media:contributor` as an authority-reference field
+pointing at `personauthority` and/or `orgauthority` &mdash; a CollectionSpace
+configuration change made outside this app, in your tenant bindings, not
+something this app can do for you. Without that configuration,
+CollectionSpace still stores the value this app sends (a syntactically
+valid refName), it just won't be treated as a formal, resolvable link by
+CollectionSpace's own screens.
+
+Only one Contributor can be set per Media record &mdash; matching the stock
+schema's single, non-repeatable `contributor` field. Supporting more than
+one would require your CollectionSpace tenant's schema to be customized
+to make it repeatable, which is beyond what this app's own code controls.
+
+### Validation
+
+Like Object Number, the Contributor field only ever submits a refName
+drawn from the fixed, configured set &mdash; typed text that doesn't exactly
+match a suggestion is blocked client-side (see
+[Typing a Contributor](#typing-a-contributor) above) rather than
+submitted as free text. But `create()` never trusts that alone: it re-runs
+`check_contributor_feature_availability()` and re-fetches the current,
+combined Person+Organization term list via `fetch_contributor_choices()`
+at submit time, and rejects the submission (creating nothing) if the
+submitted refName doesn't exactly match a term in that fresh fetch &mdash;
+covering a permission revoked, an instance reconfigured, or a term
+deleted between page load and submission, not just a tampered request.
 
 ## Relating a Media record to an Object record
 

@@ -74,6 +74,7 @@ from xml.sax.saxutils import escape
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 import requests
+import yaml
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 
 app = Flask(__name__)
@@ -91,6 +92,27 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # silently refuse to send the cookie back and login will appear to "not
 # stick".
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("FLASK_SESSION_COOKIE_SECURE") == "1"
+
+# The fixed set of Authority instances the "Contributor" field is allowed
+# to draw terms from lives in a YAML file, NOT an environment variable --
+# see load_contributor_authority_config() below for the format. This is
+# checked-into-the-repo, team-shared config (which instances are allowed
+# is the same answer for everyone who runs this app), unlike the
+# per-deployment secrets/settings below (AWS profile, Flask secret key,
+# ...), which stay environment variables since each person/deployment
+# legitimately needs different values for those.
+#
+# Default location: a file named by CONTRIBUTOR_AUTHORITIES_CONFIG_FILENAME
+# (below), sitting next to app.py itself -- so it's found automatically
+# after a plain `git clone` with zero setup, the same way requirements.txt
+# is. CONTRIBUTOR_AUTHORITIES_CONFIG_PATH is the one narrow escape hatch:
+# set it to point somewhere else (e.g. for a local override that
+# shouldn't be committed) without touching the shared file.
+CONTRIBUTOR_AUTHORITIES_CONFIG_FILENAME = "contributor_authorities.yaml"
+CONTRIBUTOR_AUTHORITIES_CONFIG_PATH = os.environ.get(
+    "CONTRIBUTOR_AUTHORITIES_CONFIG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), CONTRIBUTOR_AUTHORITIES_CONFIG_FILENAME),
+)
 
 SECRET_NAME_PREFIX = "collectionspace-uploader/session"
 _secrets_client = None
@@ -230,10 +252,12 @@ INDEX_TEMPLATE = """
   <style>
     body { font-family: sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; color: #1c1e21; }
     label { display: block; margin-top: 14px; font-weight: 600; }
-    input[type=text], input[type=file] {
+    input[type=text], input[type=file], select {
       width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box;
-      border: 1px solid #ccc; border-radius: 4px;
+      border: 1px solid #ccc; border-radius: 4px; font-family: inherit; font-size: 1em;
+      background: white;
     }
+    select:disabled { background: #f4f6f8; color: #999; }
     button {
       margin-top: 22px; padding: 10px 22px; border: none; border-radius: 6px;
       background: #2563eb; color: white; font-size: 1em; cursor: pointer;
@@ -294,6 +318,38 @@ INDEX_TEMPLATE = """
     <label for="file">Photo or document to upload <span class="required" aria-hidden="true">*</span></label>
     <input type="file" id="file" name="file" required>
 
+    <label for="contributor_display">Contributor</label>
+    <input
+      type="text"
+      id="contributor_display"
+      placeholder="Start typing a person or organization's name…"
+      autocomplete="off"
+      list="contributor_options"
+      {% if not can_use_contributor %} disabled{% endif %}
+    >
+    <datalist id="contributor_options">
+      {% for choice in contributor_choices %}
+      <option value="{{ choice.label }}"></option>
+      {% endfor %}
+    </datalist>
+    <input type="hidden" id="contributor" name="contributor" value="">
+    <div id="contributor_check_result" class="check-result" aria-live="polite"></div>
+    {% if can_use_contributor %}
+    <div class="hint">
+      Optional. Start typing a name and pick a match from the suggestions
+      &mdash; only people/organizations from this CollectionSpace instance's
+      configured Person/Organization Authority list(s) can be chosen, not
+      free text.
+    </div>
+    {% else %}
+    <div class="permission-warning">
+      The Contributor field isn't available:
+      <ul>
+        {% for e in contributor_errors %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
     <div class="checkbox-row">
       <input type="checkbox" id="relate_to_object" name="relate_to_object"{% if not can_relate_to_object %} disabled{% endif %}>
       <label for="relate_to_object">Relate this Media record to an existing Object record</label>
@@ -333,6 +389,23 @@ INDEX_TEMPLATE = """
     const objectNumberInput = document.getElementById("object_number");
     const objectNumberResultEl = document.getElementById("object_number_check_result");
     const objectNumberRequiredMarker = document.getElementById("object_number_required");
+    const contributorDisplayInput = document.getElementById("contributor_display");
+    const contributorHiddenInput = document.getElementById("contributor");
+    const contributorResultEl = document.getElementById("contributor_check_result");
+
+    // Contributor choices for THIS page load, embedded server-side (same
+    // list fetch_contributor_choices() built for the <datalist> options
+    // above) -- {refName, label, ...} per choice. Looked up here purely to
+    // translate the human-readable label the user typed/picked back into
+    // the refName that actually gets submitted; create() re-fetches and
+    // re-validates this independently server-side regardless (see
+    // _find_contributor_choice_by_refname() in app.py), so nothing here
+    // needs to be trusted.
+    const contributorChoices = {{ contributor_choices | tojson }};
+    const contributorLabelToRefName = {};
+    for (const choice of contributorChoices) {
+      contributorLabelToRefName[choice.label.toLowerCase()] = choice.refName;
+    }
 
     // Whether the CURRENT value of Object Number has been confirmed, via a
     // successful Check, to match exactly one existing Object record. Reset
@@ -340,9 +413,43 @@ INDEX_TEMPLATE = """
     // anything other than a clean match, so it can never go stale.
     let objectNumberConfirmed = false;
 
+    // Syncs the hidden "contributor" field (the refName actually submitted)
+    // from whatever's currently typed into the visible, human-readable
+    // Contributor field, and reports whether that's in a submittable state.
+    // Empty text is fine (means "no Contributor," same as before this was
+    // a dropdown) -- what's NOT fine is non-empty text that doesn't exactly
+    // match one of the suggestions, since submitting that would otherwise
+    // silently go through as "no Contributor" instead of what the user
+    // actually meant to pick. Matching is case-insensitive so a manually
+    // typed name doesn't have to match the suggestion's capitalization
+    // exactly, but it does have to be a whole, exact name -- not a partial
+    // typed prefix left unselected.
+    function updateContributorMatch() {
+      const typed = contributorDisplayInput.value.trim();
+      contributorResultEl.textContent = "";
+      contributorResultEl.className = "check-result";
+
+      if (typed === "") {
+        contributorHiddenInput.value = "";
+        return true;
+      }
+
+      const refName = contributorLabelToRefName[typed.toLowerCase()];
+      if (refName) {
+        contributorHiddenInput.value = refName;
+        return true;
+      }
+
+      contributorHiddenInput.value = "";
+      contributorResultEl.textContent = "✗ No configured Contributor matches \"" + typed + "\" -- pick one from the suggestions.";
+      contributorResultEl.classList.add("check-result-fail");
+      return false;
+    }
+
     // Required-fields-filled AND (not relating, or the Object Number has
-    // been confirmed) -- both conditions have to hold for the button to be
-    // enabled, matching what create() itself requires server-side.
+    // been confirmed) AND (Contributor is empty or a confirmed match) --
+    // all conditions have to hold for the button to be enabled, matching
+    // what create() itself requires server-side.
     function updateCreateButtonState() {
       // Object Number is only actually required while relating is turned
       // on, so its "*" only shows then too, rather than marking it
@@ -355,14 +462,16 @@ INDEX_TEMPLATE = """
         fileInput.files.length > 0;
 
       const relateSatisfied = !relateCheckbox.checked || objectNumberConfirmed;
+      const contributorSatisfied = updateContributorMatch();
 
-      createButton.disabled = !(requiredFieldsFilled && relateSatisfied);
+      createButton.disabled = !(requiredFieldsFilled && relateSatisfied && contributorSatisfied);
     }
 
     titleInput.addEventListener("input", updateCreateButtonState);
     identificationNumberInput.addEventListener("input", updateCreateButtonState);
     fileInput.addEventListener("change", updateCreateButtonState);
     relateCheckbox.addEventListener("change", updateCreateButtonState);
+    contributorDisplayInput.addEventListener("input", updateCreateButtonState);
 
     async function checkObjectNumber() {
       const button = document.getElementById("check_object_number_btn");
@@ -497,14 +606,27 @@ def normalize_base_url(raw_url: str) -> str:
     return url
 
 
-def build_media_payload(title: str, identification_number: str) -> bytes:
-    """Build the XML body for POST /media (media_common part only)."""
+def build_media_payload(title: str, identification_number: str, contributor_ref_name: str = "") -> bytes:
+    """Build the XML body for POST /media (media_common part only).
+
+    contributor_ref_name, when non-empty, is expected to be a Person or
+    Organization Authority TERM's CollectionSpace refName (see
+    fetch_contributor_choices()), already validated by the caller
+    against the fixed set of configured Authority instances -- this
+    function just embeds it. Left empty (the default), no <contributor>
+    element is sent at all, since the field is optional and an empty
+    element isn't the same as "not set" to CollectionSpace.
+    """
+    contributor_element = (
+        f"  <contributor>{escape(contributor_ref_name)}</contributor>\n" if contributor_ref_name else ""
+    )
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<document name="media">\n'
         '<ns2:media_common xmlns:ns2="http://collectionspace.org/services/media">\n'
         f"  <title>{escape(title)}</title>\n"
         f"  <identificationNumber>{escape(identification_number)}</identificationNumber>\n"
+        f"{contributor_element}"
         "</ns2:media_common>\n"
         "</document>"
     )
@@ -788,6 +910,206 @@ def verify_collectionobject_search_permissions(base_url: str, username: str, pas
     return True, None
 
 
+# REST paths for the two authority services Contributor is scoped to
+# (see PersonClient.SERVICE_NAME / OrganizationClient.SERVICE_NAME in the
+# CollectionSpace services source -- each is both the resource path and
+# the resourceName checked in accountperms). Deliberately just these two,
+# out of every authority type CollectionSpace has (Place, Concept, Work,
+# Taxonomy, ...) -- a Media record's contributor is sensibly either a
+# person or an organization, never a place or a concept, so this app
+# never requests or checks permissions on any authority resource beyond
+# these.
+PERSON_AUTHORITY_SERVICE_PATH = "personauthorities"
+ORGANIZATION_AUTHORITY_SERVICE_PATH = "orgauthorities"
+
+
+def load_contributor_authority_config():
+    """Load the fixed set of Authority instances Contributor draws from,
+    from the YAML file at CONTRIBUTOR_AUTHORITIES_CONFIG_PATH.
+
+    Read fresh on every call -- deliberately NOT cached at import time --
+    so that a teammate editing the shared, checked-in YAML file takes
+    effect on the next page load or submission, with no app restart
+    needed. That responsiveness is a real point of moving this out of
+    environment variables for a team that shares one copy of this app:
+    editing an env var would need a restart (and touch each person's own
+    environment) either way.
+
+    Expected shape (see contributor_authorities.yaml for the real,
+    commented template):
+        person_authority_instances:
+          - photographers
+          - donors
+        organization_authority_instances:
+          - institutions
+
+    Either key may be omitted (treated as an empty list); an absent file
+    is ALSO treated as both lists being empty, mirroring the old "unset
+    environment variable" behavior -- so a team clones this repo, and
+    before anyone edits contributor_authorities.yaml, Contributor is
+    simply unavailable, not a startup error.
+
+    Returns ({"person": [...], "organization": [...]}, None) on success.
+    Returns (None, error_message) if the file exists but can't be read
+    or parsed, or is shaped wrong (not a mapping, or either key isn't a
+    list of strings) -- a real misconfiguration worth surfacing plainly,
+    the same "don't silently guess" philosophy as
+    find_collectionobject_by_number().
+    """
+    if not os.path.exists(CONTRIBUTOR_AUTHORITIES_CONFIG_PATH):
+        return {"person": [], "organization": []}, None
+
+    try:
+        with open(CONTRIBUTOR_AUTHORITIES_CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            raw = yaml.safe_load(config_file)
+    except OSError as exc:
+        return None, (
+            f"Couldn't read the Contributor authorities config file at "
+            f"{CONTRIBUTOR_AUTHORITIES_CONFIG_PATH!r}: {exc}"
+        )
+    except yaml.YAMLError as exc:
+        return None, (
+            f"The Contributor authorities config file at "
+            f"{CONTRIBUTOR_AUTHORITIES_CONFIG_PATH!r} isn't valid YAML: {exc}"
+        )
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        return None, (
+            f"The Contributor authorities config file at "
+            f"{CONTRIBUTOR_AUTHORITIES_CONFIG_PATH!r} must be a YAML mapping "
+            "with 'person_authority_instances' and/or "
+            "'organization_authority_instances' keys -- see "
+            "contributor_authorities.yaml's own comments for the expected format."
+        )
+
+    def _string_list(value, key):
+        if value is None:
+            return [], None
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return None, (
+                f"'{key}' in the Contributor authorities config file must be a "
+                "YAML list of strings (shortIdentifiers), e.g.:\n"
+                f"{key}:\n  - some-short-id"
+            )
+        return [item.strip() for item in value if item.strip()], None
+
+    person_instances, error = _string_list(raw.get("person_authority_instances"), "person_authority_instances")
+    if error:
+        return None, error
+
+    organization_instances, error = _string_list(
+        raw.get("organization_authority_instances"), "organization_authority_instances"
+    )
+    if error:
+        return None, error
+
+    return {"person": person_instances, "organization": organization_instances}, None
+
+
+def _contributor_authority_types(config):
+    """Build the (human-readable label, REST service path ==
+    accountperms resourceName, configured instance shortIdentifiers)
+    tuples check_contributor_feature_availability() and
+    fetch_contributor_choices() both iterate over, from a config dict
+    returned by load_contributor_authority_config().
+
+    A function rather than a module-level constant because the config
+    itself is no longer fixed at import time (see
+    load_contributor_authority_config()) -- every caller re-derives this
+    from its own fresh load, so both functions always agree with each
+    other and with the file's CURRENT contents.
+    """
+    return (
+        ("Person", PERSON_AUTHORITY_SERVICE_PATH, config["person"]),
+        ("Organization", ORGANIZATION_AUTHORITY_SERVICE_PATH, config["organization"]),
+    )
+
+
+def _check_authority_read_permission(action_group, human_label: str, service_path: str):
+    """None if action_group includes 'R', else a "can't read <type>
+    Authority terms" error message naming that type and its REST path.
+
+    Split out for the same reason as _check_relation_create_permission()
+    and _check_collectionobject_read_permission() above -- generalized
+    over authority type (rather than hardcoded to Person) so it serves
+    both entries _contributor_authority_types() produces.
+    """
+    if "R" in action_group:
+        return None
+    return (
+        f"Your CollectionSpace account doesn't have permission to read "
+        f"{human_label} Authority records (GET /{service_path}), so it "
+        f"can't look up Contributor terms from the configured {human_label} "
+        "Authority instance(s). Ask a CollectionSpace administrator to "
+        f"grant a role with read access to {human_label} Authority records."
+    )
+
+
+def check_contributor_feature_availability(base_url: str, username: str, password: str, verify_ssl: bool):
+    """Confirm the Contributor feature can be used at all -- i.e. that
+    contributor_authorities.yaml (see load_contributor_authority_config())
+    is readable AND lists at least one instance of either type, AND this
+    account has 'R' on every authority TYPE that actually has instances
+    configured.
+
+    Deliberately scoped: an account that only has Person Authority terms
+    configured is never required to also have Organization Authority
+    read permission (and vice versa) -- only the type(s) actually in use
+    are checked, the same "don't require permissions this app doesn't
+    actually need" reasoning as verify_relation_permissions() and
+    verify_collectionobject_search_permissions() being checked
+    separately from Media permissions at login.
+
+    Mirrors check_relate_to_object_permissions(): used both to decide
+    whether to offer the Contributor field on the index page at all, and
+    by create() to do the same combined check again before trusting a
+    submitted value. Like that function, this shares a single
+    accountperms fetch across every check it needs rather than fetching
+    once per authority type. The config file is loaded fresh (see
+    load_contributor_authority_config()) and checked -- for being
+    unreadable/malformed, and for listing nothing at all -- before ever
+    making a network call, since no account permission can fix either of
+    those.
+
+    Returns (True, []) if configured and permitted. Otherwise returns
+    (False, errors), a list of one human-readable message per problem.
+    """
+    config, config_error = load_contributor_authority_config()
+    if config_error:
+        return False, [config_error]
+
+    configured_types = [
+        (human_label, service_path)
+        for human_label, service_path, instances in _contributor_authority_types(config)
+        if instances
+    ]
+
+    if not configured_types:
+        return False, [
+            "The Contributor field isn't configured yet: "
+            f"{CONTRIBUTOR_AUTHORITIES_CONFIG_PATH!r} doesn't list any Person or "
+            "Organization Authority instances. Ask whoever maintains this app's "
+            f"{CONTRIBUTOR_AUTHORITIES_CONFIG_FILENAME} file to add the "
+            "shortIdentifier(s) of the Authority instance(s) Contributor terms "
+            "should come from."
+        ]
+
+    root, error = _fetch_account_permission_root(base_url, username, password, verify_ssl)
+    if error:
+        return False, [error]
+
+    errors = []
+    for human_label, service_path in configured_types:
+        action_group = _action_group_for_resource(root, service_path)
+        message = _check_authority_read_permission(action_group, human_label, service_path)
+        if message:
+            errors.append(message)
+
+    return (not errors), errors
+
+
 def check_relate_to_object_permissions(base_url: str, username: str, password: str, verify_ssl: bool):
     """Confirm the account can use the "relate to an Object record" feature
     at all -- i.e. both verify_relation_permissions() and
@@ -1041,6 +1363,276 @@ def create_reciprocal_relations(base_url: str, username: str, password: str, ver
     return outcome, errors
 
 
+# --- "Contributor" field (fixed set of Person/Organization Authority terms) ---
+#
+# (PERSON_AUTHORITY_SERVICE_PATH, ORGANIZATION_AUTHORITY_SERVICE_PATH,
+# load_contributor_authority_config(), and _contributor_authority_types()
+# are defined earlier, alongside the permission checks that also need
+# them.)
+#
+# The Media schema's <contributor> element (media_common.xsd, in the
+# CollectionSpace services source) is a single, plain xs:string -- not
+# natively an authority-reference field, and not repeatable. This app
+# restricts what can go into it to terms drawn from a fixed, admin-chosen
+# set of Person and/or Organization Authority instances (configured in
+# contributor_authorities.yaml -- see load_contributor_authority_config()
+# above), and stores the chosen term's CollectionSpace refName -- e.g.
+#   urn:cspace:core.collectionspace.org:personauthorities:name(photographers):item:name(janedoe)'Jane Doe'
+# -- rather than a bare display name, so the value is unambiguous even if
+# two different instances (of the same or different authority type) each
+# have a term with the same display name.
+#
+# Note: storing a well-formed refName here makes the value CORRECT and
+# UNAMBIGUOUS, but whether CollectionSpace's own UI treats it as a live,
+# clickable authority reference (e.g. showing up under that Person or
+# Organization record's "used by" list) additionally depends on this
+# tenant's service bindings marking media:contributor as an
+# authority-reference field pointing at personauthority and/or
+# orgauthority -- a CollectionSpace configuration change outside this
+# app's control. See README.md.
+
+
+def fetch_authority_instance_info(base_url: str, username: str, password: str, verify_ssl: bool,
+                                   service_path: str, short_id: str):
+    """Fetch one Authority instance's own record, for its displayName.
+
+    service_path is PERSON_AUTHORITY_SERVICE_PATH or
+    ORGANIZATION_AUTHORITY_SERVICE_PATH (the only two Contributor uses --
+    see _contributor_authority_types()); the two share an identical
+    response shape (personauthority_common.xsd / orgauthority_common.xsd
+    in the CollectionSpace services source both have
+    displayName/shortIdentifier/refName/csid), so one function serves
+    both.
+
+    GET /<service_path>/urn:cspace:name(<short_id>) -- the URN-with-name
+    specifier form documented in RefNameServiceUtils.Specifier (in the
+    CollectionSpace services source), which every authority resource
+    accepts anywhere a {csid} path segment is expected, as an alternative
+    to a literal CSID.
+
+    Returns ({"csid", "shortIdentifier", "displayName"}, None) on success,
+    or (None, error_message) on a network, HTTP, or XML parsing failure --
+    including a 404, which here means "no instance with that
+    shortIdentifier exists on this service," a misconfiguration of
+    contributor_authorities.yaml worth surfacing plainly rather than
+    silently skipping.
+    """
+    instance_url = f"{base_url}/{service_path}/urn:cspace:name({short_id})"
+    try:
+        resp = requests.get(instance_url, auth=(username, password), verify=verify_ssl, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        return None, f"Could not reach {base_url} to look up Authority {short_id!r} ({service_path}): {exc}"
+
+    if resp.status_code == 404:
+        return None, (
+            f"No {service_path} instance found with shortIdentifier {short_id!r}. "
+            f"Check {CONTRIBUTOR_AUTHORITIES_CONFIG_FILENAME} for a typo, or confirm "
+            "this instance exists on this CollectionSpace tenant."
+        )
+    if resp.status_code == 401:
+        return None, "Invalid username or password for that CollectionSpace instance."
+    if resp.status_code >= 400:
+        return None, (
+            f"Looking up Authority {short_id!r} ({service_path}) failed "
+            f"(HTTP {resp.status_code})."
+        )
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as exc:
+        return None, f"Couldn't parse the {service_path} response from CollectionSpace: {exc}"
+
+    display_name_el = _find_child(root, "displayName")
+    csid_el = _find_child(root, "csid")
+    return {
+        "csid": (csid_el.text or "").strip() if csid_el is not None else "",
+        "shortIdentifier": short_id,
+        "displayName": (display_name_el.text or "").strip() if display_name_el is not None else short_id,
+    }, None
+
+
+def fetch_authority_items(base_url: str, username: str, password: str, verify_ssl: bool,
+                           service_path: str, short_id: str,
+                           page_size: int = 200, max_items: int = 5000):
+    """Fetch every term (item) in one Authority instance.
+
+    service_path is PERSON_AUTHORITY_SERVICE_PATH or
+    ORGANIZATION_AUTHORITY_SERVICE_PATH -- see fetch_authority_instance_info()
+    above; the item-list response shape is likewise shared across every
+    CollectionSpace authority type (AuthorityItemListItemJAXBSchema in
+    the services source), so one function serves both.
+
+    GET /<service_path>/urn:cspace:name(<short_id>)/items, paginated --
+    a "fixed set" instance is expected to be modest in size, but this
+    pages through the full result (rather than trusting a single page)
+    so an instance that happens to hold more than page_size terms doesn't
+    silently lose Contributor choices. max_items is a defensive cap, not
+    an expected outcome, to guarantee this can't loop forever against a
+    misbehaving or unexpectedly huge instance.
+
+    Returns (items, None) on success, where items is a list of
+    {"csid", "refName", "displayName"} dicts, or (None, error_message) on
+    a network, HTTP, XML parsing, or pagination-runaway failure.
+    """
+    items_url = f"{base_url}/{service_path}/urn:cspace:name({short_id})/items"
+    items = []
+    page_num = 0
+
+    while True:
+        try:
+            resp = requests.get(
+                items_url,
+                params={"pgSz": page_size, "pgNum": page_num},
+                auth=(username, password),
+                verify=verify_ssl,
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as exc:
+            return None, f"Could not reach {base_url} to list terms for Authority {short_id!r} ({service_path}): {exc}"
+
+        if resp.status_code == 401:
+            return None, "Invalid username or password for that CollectionSpace instance."
+        if resp.status_code >= 400:
+            return None, (
+                f"Listing terms for Authority {short_id!r} ({service_path}) failed "
+                f"(HTTP {resp.status_code})."
+            )
+
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError as exc:
+            return None, f"Couldn't parse the {service_path} items response from CollectionSpace: {exc}"
+
+        items_in_page = 0
+        for element in root:
+            if _local_tag(element.tag) != "list-item":
+                continue
+            items_in_page += 1
+            # An Authority item list result's display-name element is
+            # named "termDisplayName" (see AuthorityItemJAXBSchema.TERM_
+            # DISPLAY_NAME in the services source) -- NOT "displayName",
+            # which is the Vocabulary service's naming for the same
+            # concept (AuthorityItemJAXBSchema.DISPLAY_NAME). A back-compat
+            # comment on AuthorityItemDocumentModelHandler.
+            # getListResultsDisplayNameField() notes older CollectionSpace
+            # versions may still emit "displayName" for Authority items
+            # too, so we check both, in this order, before ever falling
+            # back to the refName.
+            display_name_el = _find_child(element, "termDisplayName")
+            if display_name_el is None:
+                display_name_el = _find_child(element, "displayName")
+            ref_name_el = _find_child(element, "refName")
+            csid_el = _find_child(element, "csid")
+            if ref_name_el is None or not (ref_name_el.text or "").strip():
+                # Shouldn't happen for a real Authority term, but skip
+                # rather than fail the whole instance over one malformed
+                # entry -- there's nothing usable to offer for it either
+                # way.
+                continue
+            display_name_text = (display_name_el.text or "").strip() if display_name_el is not None else ""
+            items.append({
+                "csid": (csid_el.text or "").strip() if csid_el is not None else "",
+                "refName": ref_name_el.text.strip(),
+                # Falling back to the refName here is a last resort for a
+                # term that genuinely has neither element populated --
+                # not the expected path -- so Contributor still offers
+                # *something* selectable for it rather than silently
+                # dropping the term.
+                "displayName": display_name_text if display_name_text else ref_name_el.text.strip(),
+            })
+
+        if len(items) > max_items:
+            return None, (
+                f"Authority {short_id!r} ({service_path}) has more than {max_items} "
+                "terms, which is more than this app expects for a \"fixed set\" -- "
+                "stopping rather than keep paginating. If that's genuinely "
+                "expected, raise fetch_authority_items()'s max_items."
+            )
+
+        total_items_el = _find_child(root, "totalItems")
+        total_items = int((total_items_el.text or "0").strip()) if total_items_el is not None else len(items)
+
+        if items_in_page == 0 or len(items) >= total_items:
+            break
+        page_num += 1
+
+    return items, None
+
+
+def fetch_contributor_choices(base_url: str, username: str, password: str, verify_ssl: bool):
+    """Fetch the full, combined list of Contributor choices across every
+    entry currently listed in contributor_authorities.yaml, for BOTH
+    authority types (see load_contributor_authority_config() /
+    _contributor_authority_types()).
+
+    Loads the config fresh (not cached), so this always reflects the
+    file's CURRENT contents -- if it's unreadable/malformed, that's
+    surfaced the same way a lookup failure is (see below), since either
+    one means this function can't produce a trustworthy result.
+
+    Fails closed: if ANY configured instance can't be read (typo'd
+    shortIdentifier, a permission or network problem, etc.), this
+    returns an error rather than silently offering a partial list --
+    matching this app's general philosophy (see find_collectionobject_by_number())
+    of surfacing ambiguity/failure rather than guessing.
+
+    Returns (choices, None) on success, where choices is a list of
+    {"refName", "label", "term_display_name", "instance_display_name",
+    "authority_type"} dicts sorted by term display name, then by
+    authority instance display name (to keep same-named terms from
+    different instances adjacent and distinguishable) -- "label" is
+    "<term display name> — <authority instance display name>",
+    disambiguating same-named terms from different instances (and from
+    different authority types -- a Person and an Organization can
+    coincidentally share a display name too). Returns
+    (None, error_message) if the config couldn't be loaded, or if any
+    configured instance's lookup failed.
+    """
+    config, config_error = load_contributor_authority_config()
+    if config_error:
+        return None, config_error
+
+    choices = []
+    for human_label, service_path, instances in _contributor_authority_types(config):
+        for short_id in instances:
+            instance_info, error = fetch_authority_instance_info(
+                base_url, username, password, verify_ssl, service_path, short_id
+            )
+            if error:
+                return None, error
+
+            items, error = fetch_authority_items(base_url, username, password, verify_ssl, service_path, short_id)
+            if error:
+                return None, error
+
+            for item in items:
+                choices.append({
+                    "refName": item["refName"],
+                    "label": f"{item['displayName']} — {instance_info['displayName']}",
+                    "term_display_name": item["displayName"],
+                    "instance_display_name": instance_info["displayName"],
+                    "authority_type": human_label,
+                })
+
+    choices.sort(key=lambda c: (c["term_display_name"].lower(), c["instance_display_name"].lower()))
+    return choices, None
+
+
+def _find_contributor_choice_by_refname(choices, ref_name: str):
+    """The single choice in `choices` (see fetch_contributor_choices())
+    whose refName exactly matches ref_name, or None if there isn't one.
+
+    Used by create() to re-validate a submitted Contributor against the
+    CURRENT fixed set server-side -- never trusting the <select> alone --
+    the same fail-closed spirit as find_collectionobject_by_number()'s
+    "don't guess" handling of zero/multiple matches.
+    """
+    for choice in choices:
+        if choice["refName"] == ref_name:
+            return choice
+    return None
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
@@ -1159,12 +1751,34 @@ def index():
         creds["instance_url"], creds["username"], creds["password"], creds["verify_ssl"]
     )
 
+    # Same idea for the Contributor field: checked up front so it can be
+    # disabled -- with an explanation -- rather than offered and only
+    # failing at submit time. Unlike "relate to Object," a passing
+    # permission/config check here also means fetching the actual list of
+    # choices right away (there's no separate "Check" step for
+    # Contributor), so a failure fetching THAT is treated the same as a
+    # failed permission/config check: disable the field and show why.
+    contributor_choices = []
+    can_use_contributor, contributor_errors = check_contributor_feature_availability(
+        creds["instance_url"], creds["username"], creds["password"], creds["verify_ssl"]
+    )
+    if can_use_contributor:
+        contributor_choices, fetch_error = fetch_contributor_choices(
+            creds["instance_url"], creds["username"], creds["password"], creds["verify_ssl"]
+        )
+        if fetch_error:
+            can_use_contributor = False
+            contributor_errors = [fetch_error]
+
     return render_template_string(
         INDEX_TEMPLATE,
         username=session.get("cs_username"),
         instance_url=session.get("cs_instance_url"),
         can_relate_to_object=can_relate_to_object,
         relate_permission_errors=relate_permission_errors,
+        can_use_contributor=can_use_contributor,
+        contributor_errors=contributor_errors,
+        contributor_choices=contributor_choices,
     )
 
 
@@ -1233,6 +1847,7 @@ def create():
     title = request.form.get("title", "")
     identification_number = request.form.get("identification_number", "")
     uploaded_file = request.files.get("file")
+    contributor_ref_name = request.form.get("contributor", "").strip()
     relate_to_object = request.form.get("relate_to_object") == "on"
     object_number = request.form.get("object_number", "").strip()
 
@@ -1259,6 +1874,71 @@ def create():
             ),
             400,
         )
+
+    # If a Contributor was chosen, re-validate it against the CURRENT fixed
+    # set of Person/Organization Authority terms -- never trust the
+    # <select> alone, the same reasoning as re-checking Object Number
+    # below. This also protects against contributor_authorities.yaml or
+    # the underlying Authority data having changed between page load and
+    # submission (a teammate edited the file, an instance was renamed, a
+    # term was deleted, a permission was revoked), not just a tampered
+    # request. Runs before anything is created, so a stale/invalid
+    # Contributor selection can never leave behind an
+    # orphaned Media record either.
+    contributor_choice = None
+    if contributor_ref_name:
+        can_use_contributor, contributor_permission_errors = check_contributor_feature_availability(
+            base_url, creds["username"], creds["password"], verify_ssl
+        )
+        if not can_use_contributor:
+            return (
+                render_template_string(
+                    RESULT_TEMPLATE,
+                    success=False,
+                    message="Please fix the following and try again:",
+                    errors=contributor_permission_errors,
+                    details=None,
+                    username=creds["username"],
+                    instance_url=base_url,
+                ),
+                403,
+            )
+
+        contributor_choices, fetch_error = fetch_contributor_choices(
+            base_url, creds["username"], creds["password"], verify_ssl
+        )
+        if fetch_error:
+            return (
+                render_template_string(
+                    RESULT_TEMPLATE,
+                    success=False,
+                    message="Please fix the following and try again:",
+                    errors=[fetch_error],
+                    details=None,
+                    username=creds["username"],
+                    instance_url=base_url,
+                ),
+                502,
+            )
+
+        contributor_choice = _find_contributor_choice_by_refname(contributor_choices, contributor_ref_name)
+        if contributor_choice is None:
+            return (
+                render_template_string(
+                    RESULT_TEMPLATE,
+                    success=False,
+                    message="Please fix the following and try again:",
+                    errors=[
+                        "The selected Contributor is no longer in the allowed list "
+                        "(it may have been removed, or the configured Authority "
+                        "instances changed). Reload the page and choose again."
+                    ],
+                    details=None,
+                    username=creds["username"],
+                    instance_url=base_url,
+                ),
+                400,
+            )
 
     # If asked to relate this Media record to an existing Object record,
     # confirm the account has both permissions this feature needs --
@@ -1310,7 +1990,10 @@ def create():
 
     # --- Step 1: create the Media record (metadata only) ---
     media_url = f"{base_url}/media"
-    payload = build_media_payload(title, identification_number)
+    payload = build_media_payload(
+        title, identification_number,
+        contributor_ref_name=contributor_choice["refName"] if contributor_choice else "",
+    )
     try:
         create_resp = requests.post(
             media_url,
@@ -1426,6 +2109,8 @@ def create():
         "blob_record": f"{base_url}/media/{media_csid}/blob",
         "blob_content": f"{base_url}/media/{media_csid}/blob/content",
     }
+    if contributor_choice:
+        details["contributor"] = contributor_choice["label"]
 
     # --- Step 3 (optional): relate the Media record to the Object record ---
     #

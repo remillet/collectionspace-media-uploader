@@ -1,0 +1,38 @@
+# Contributor field configuration
+# =================================
+#
+# This file lists the CollectionSpace Person and/or Organization
+# Authority instances the "Contributor" field on the Media Uploader form
+# is allowed to draw terms from -- see the "The Contributor field"
+# section of README.md for the full explanation.
+#
+# This file is meant to be committed to the repo and shared by everyone
+# on the team who runs this app, so the list of allowed Contributors is
+# the same for everyone by default. It's read fresh on every page load,
+# so an edit here takes effect the next time someone loads the form --
+# no app restart needed.
+#
+# Each entry is a Person or Organization Authority instance's
+# shortIdentifier -- NOT its display name. If you're not sure what an
+# instance's shortIdentifier is, you can look it up with:
+#
+#   curl -u your_username https://your-instance.collectionspace.org/cspace-services/personauthorities
+#   curl -u your_username https://your-instance.collectionspace.org/cspace-services/orgauthorities
+#
+# and match the human-readable <displayName> you recognize to the
+# <shortIdentifier> next to it.
+#
+# Both lists below start empty, which means the Contributor field is
+# disabled until at least one instance is added to either one -- add
+# entries under whichever key(s) apply, e.g.:
+#
+# person_authority_instances:
+#   - photographers
+#   - donors
+# organization_authority_instances:
+#   - institutions
+#   - partner-orgs
+
+person_authority_instances: [person]
+
+organization_authority_instances: [organization]
